@@ -1,0 +1,98 @@
+pipeline {
+    agent any
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/venkatasai449/hello-web.git'
+                sh 'echo Workspace: $(pwd) && ls -la'
+            }
+        }
+
+        stage('Build with Maven') {
+            steps {
+                sh '''
+                  set -eux
+                  mvn -B -DskipTests clean package
+                  echo "Built artifacts:"
+                  ls -l target/
+                '''
+            }
+        }
+
+        stage('Prepare Ansible Files') {
+            steps {
+                sh '''
+                  set -eux
+                  test -f /var/lib/jenkins/.ssh/app.pem
+                  chmod 600 /var/lib/jenkins/.ssh/app.pem
+                  mkdir -p /var/lib/jenkins/.ssh
+                  ssh-keyscan -H <app-ec2-ip> >> ~/.ssh/known_hosts
+                '''
+            }
+        }
+
+        stage('Preflight: Ansible ping') {
+            steps {
+                sh '''
+                  set -eux
+                  ansible -i inventory.ini app -m ping
+                '''
+            }
+        }
+
+        stage('Deploy with Ansible') {
+            steps {
+                writeFile file: 'deploy.yml', text: '''
+                - hosts: app
+                  become: true
+                  tasks:
+                    - name: Ensure Java installed
+                      apt:
+                        name: openjdk-17-jdk
+                        state: present
+                        update_cache: yes
+
+                    - name: Ensure Tomcat9 installed
+                      apt:
+                        name: tomcat9
+                        state: present
+
+                    - name: Copy WAR to Tomcat
+                      copy:
+                        src: target/hello-web-1.0-SNAPSHOT.war
+                        dest: /var/lib/tomcat9/webapps/ROOT.war
+                        owner: tomcat
+                        group: tomcat
+                        mode: '0644'
+
+                    - name: Restart Tomcat
+                      service:
+                        name: tomcat9
+                        state: restarted
+                '''
+                sh '''
+                  set -eux
+                  ansible-playbook -i inventory.ini deploy.yml
+                '''
+            }
+        }
+
+        stage('Smoke test from Jenkins') {
+            steps {
+                sh '''
+                  sleep 10
+                  curl -s http://<app-ec2-ip>:8080/ | grep "CI/CD pipeline is working"
+                '''
+            }
+        }
+    }
+    post {
+        success {
+            echo "✅ Deployment successful! Access the app at: http://<app-ec2-ip>:8080/"
+        }
+        failure {
+            echo "❌ Deployment failed. Check Ansible/Jenkins logs."
+        }
+    }
+}
+
