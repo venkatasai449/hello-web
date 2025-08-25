@@ -14,166 +14,108 @@ pipeline {
 
   stages {
 
-    stage('Checkout') {
+    stage('Checkout & Build') {
       steps {
-        // Fetches your source code from the configured SCM (e.g., Git)
-        checkout scm
         sh '''
           set -eux
           echo "Workspace: $(pwd)"
+          checkout scm
           ls -la
-        '''
-      }
-    }
-
-    stage('Build with Maven') {
-      steps {
-        // Builds the project using Maven, skipping tests, and packages it into a WAR file
-        sh '''
-          set -eux
+          echo "Building with Maven..."
           mvn -B -DskipTests clean package
           echo "Built artifacts:"
           ls -l target/
-          test -f "target/${WAR_NAME}" # Verifies that the WAR file was created
+          test -f "target/${WAR_NAME}"
         '''
       }
     }
 
-    stage('Copy WAR to server') {
+    stage('Deploy to Tomcat') {
       steps {
-        // Copies the generated WAR file from Jenkins workspace to the remote server's /tmp directory
         sh '''
           set -eux
           test -f "${SSH_KEY}"
-          chmod 600 "${SSH_KEY}" # Sets appropriate permissions for the SSH key
+          chmod 600 "${SSH_KEY}"
+
+          # Copy WAR to remote server
+          echo "Copying ${WAR_NAME} to remote server..."
           scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
               "target/${WAR_NAME}" "${REMOTE_USER}@${HOST}:/tmp/${WAR_NAME}"
-        '''
-      }
-    }
 
-    stage('Provision Tomcat & Deploy') {
-      steps {
-        // Connects to the remote server via SSH and performs Tomcat installation and application deployment
-        sh '''
-          set -eux
+          # SSH into remote server for provisioning and deployment
           ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
             "${REMOTE_USER}@${HOST}" '
               set -eux
+              export DEBIAN_FRONTEND=noninteractive
 
-              # ---- Detect package manager (Ubuntu/Debian vs RHEL/AL2/AL2023) ----
-              # This block intelligently detects the OS and installs Java and Tomcat
-              # based on whether 'apt-get' or 'dnf'/'yum' is available.
-              if command -v apt-get >/dev/null 2>&1; then
-                export DEBIAN_FRONTEND=noninteractive
-                sudo apt-get update -y
-                sudo apt-get install -y default-jdk-headless || sudo apt-get install -y openjdk-11-jre-headless || true
+              # Install Java and Tomcat (assuming Ubuntu/Debian and tomcat9)
+              echo "Updating packages and installing Java/Tomcat9..."
+              sudo apt-get update -y
+              sudo apt-get install -y openjdk-11-jre-headless tomcat9 || true
 
-                if ! dpkg -s tomcat10 >/dev/null 2>&1; then
-                  sudo apt-get install -y tomcat10 || true
-                fi
-                if ! dpkg -s tomcat10 >/dev/null 2>&1 && ! dpkg -s tomcat9 >/dev/null 2>&1; then
-                  sudo apt-get install -y tomcat9
-                fi
+              # Define Tomcat service and webapps directory
+              SVC=tomcat9
+              WEBAPPS=/var/lib/tomcat9/webapps
+              TOMCAT_RUN_USER="tomcat" # Standard user for tomcat9 on Ubuntu/Debian
+              TOMCAT_RUN_GROUP="tomcat" # Standard group for tomcat9 on Ubuntu/Debian
 
-                if systemctl list-unit-files | grep -q "^tomcat10\\.service"; then
-                  SVC=tomcat10; WEBAPPS=/var/lib/tomcat10/webapps
-                else
-                  SVC=tomcat9;  WEBAPPS=/var/lib/tomcat9/webapps
-                fi
-                sudo mkdir -p "$WEBAPPS"
-              elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
-                PKG=dnf; command -v yum >/dev/null 2>&1 && PKG=yum
-                sudo $PKG -y install java-11-openjdk-headless || sudo $PKG -y install java-17-openjdk-headless || true
-                sudo $PKG -y install tomcat
-
-                SVC=tomcat
-                if [ -d /usr/share/tomcat/webapps ]; then
-                  WEBAPPS=/usr/share/tomcat/webapps
-                elif [ -d /var/lib/tomcat/webapps ]; then
-                  WEBAPPS=/var/lib/tomcat/webapps
-                else
-                  WEBAPPS=/usr/share/tomcat/webapps
-                  sudo mkdir -p "$WEBAPPS"
-                fi
-              else
-                echo "Unsupported OS (need apt, dnf, or yum)" >&2
-                exit 1
-              fi
-
-              echo "Using Tomcat service: $SVC"
-              echo "Using webapps directory: $WEBAPPS"
-
-              # ---- Stop Tomcat if running (ignore errors) ----
-              sudo systemctl stop "$SVC" || true
-
-              # ---- Clean old deployment ----
-              # Removes any previously deployed version of the application
-              sudo rm -rf "$WEBAPPS/'"${APP_CTX}"'" "$WEBAPPS/'"${WAR_NAME}"'" || true
-
-              # ---- Ensure webapps directory has correct permissions for Tomcat to unpack WARs ----
-              # This is CRUCIAL for successful deployment. Tomcat needs write access to its webapps directory.
-              TOMCAT_RUN_USER=""
-              TOMCAT_RUN_GROUP=""
-
-              if id tomcat >/dev/null 2>&1; then
-                  TOMCAT_RUN_USER="tomcat"
-                  TOMCAT_RUN_GROUP=$(id -gn tomcat || echo "tomcat")
-              elif id www-data >/dev/null 2>&1; then # Common for web servers on Debian/Ubuntu
+              # Fallback for www-data if tomcat user isn't found
+              if ! id -u "$TOMCAT_RUN_USER" >/dev/null 2>&1; then
                   TOMCAT_RUN_USER="www-data"
-                  TOMCAT_RUN_GROUP=$(id -gn www-data || echo "www-data")
+                  TOMCAT_RUN_GROUP="www-data"
               fi
+              echo "Using Tomcat service: $SVC, Webapps: $WEBAPPS, User: $TOMCAT_RUN_USER"
 
-              if [ -n "$TOMCAT_RUN_USER" ]; then
-                  echo "Setting ownership of $WEBAPPS to $TOMCAT_RUN_USER:$TOMCAT_RUN_GROUP"
-                  sudo chown -R "$TOMCAT_RUN_USER":"$TOMCAT_RUN_GROUP" "$WEBAPPS"
-                  sudo chmod -R u+rwx,g+rwx,o+rx "$WEBAPPS" # Grant read/write/execute for owner and group
-              else
-                  echo "⚠️ Warning: No suitable Tomcat user ('tomcat' or 'www-data') found. Skipping explicit ownership change for $WEBAPPS. Deployment might fail due to permissions."
-              fi
+              # Stop Tomcat
+              echo "Stopping Tomcat service..."
+              sudo systemctl stop "$SVC" || true
+              sleep 5
 
-              # ---- Move new WAR ----
-              # Moves the WAR file into Tomcat's webapps directory for automatic deployment
+              # Clean old deployment and ensure webapps permissions
+              echo "Cleaning old deployment and setting permissions for $WEBAPPS..."
+              sudo rm -rf "$WEBAPPS/'"${APP_CTX}"'" "$WEBAPPS/'"${WAR_NAME}"'" || true
+              sudo chown -R "$TOMCAT_RUN_USER":"$TOMCAT_RUN_GROUP" "$WEBAPPS"
+              sudo chmod -R u+rwx,g+rwx,o+rx "$WEBAPPS"
+              
+              # Move new WAR to webapps
+              echo "Moving ${WAR_NAME} to $WEBAPPS..."
               sudo mv /tmp/'"${WAR_NAME}"' "$WEBAPPS/'"${WAR_NAME}"'"
-              # Explicitly sets ownership of the new WAR file to the Tomcat user/group
-              if [ -n "$TOMCAT_RUN_USER" ]; then
-                  sudo chown "$TOMCAT_RUN_USER":"$TOMCAT_RUN_GROUP" "$WEBAPPS/'"${WAR_NAME}"'" || true
-              fi
+              sudo chown "$TOMCAT_RUN_USER":"$TOMCAT_RUN_GROUP" "$WEBAPPS/'"${WAR_NAME}"'"
 
-              # ---- Start & verify Tomcat ----
+              # Start Tomcat
+              echo "Starting Tomcat service..."
               sudo systemctl start "$SVC"
-              sudo systemctl is-active "$SVC"
-              sleep 10 # Gives Tomcat more time to start up and unpack the WAR
+              sleep 15
 
-              # Quick log peek (non-fatal) - show more relevant logs for debugging
-              echo "--- Checking Tomcat service status and logs ---"
-              sudo systemctl status "$SVC" --no-pager || true
-              echo "--- Last 200 lines of Tomcat service logs ---"
-              sudo journalctl -u "$SVC" --since "5 minutes ago" -n 200 --no-pager || true
-              echo "--- Listing webapps directory contents after deployment attempt ---"
-              sudo ls -la "$WEBAPPS" || true # Shows if 'hello' directory was created
+              # Verify deployment
+              echo "Verifying WAR unpacking..."
+              if [ -d "$WEBAPPS/'"${APP_CTX}"'" ]; then
+                  echo "✅ WAR unpacked successfully: $WEBAPPS/'"${APP_CTX}"'"
+              else
+                  echo "❌ WAR not unpacked to $WEBAPPS/'"${APP_CTX}"'. Check logs for errors."
+                  sudo journalctl -u "$SVC" --since "30 seconds ago" -n 50 --no-pager | grep -E "ERROR|WARN|catalina.log" || true
+                  exit 1
+              fi
             '
         '''
       }
     }
 
-    stage('Smoke test from Jenkins') {
+    stage('Smoke test') {
       steps {
-        // Periodically checks if the deployed application is accessible and responsive
         sh '''
           set -eux
-          # Loop for a bit longer to give the app time to fully deploy and become responsive
-          for i in $(seq 1 30); do # Increased loop count for more robust checking
-            # -f (fail silently), -s (silent), -S (show errors if -s is used)
+          echo "Initiating smoke test for http://${HOST}:8080/${APP_CTX}/"
+          for i in $(seq 1 30); do # Increased attempts for robustness
             if curl -fsS "http://${HOST}:8080/${APP_CTX}/" >/dev/null; then
               echo "App is up ✅"
               exit 0
             fi
-            echo "Attempt $i: App not yet healthy at http://${HOST}:8080/${APP_CTX}/. Retrying in 2 seconds..."
+            echo "Attempt $i: App not yet healthy. Retrying in 2 seconds..."
             sleep 2
           done
           echo "App did not become healthy in time. Final curl attempt for debugging:"
-          curl -v "http://${HOST}:8080/${APP_CTX}/" || true # Verbose curl to aid debugging
+          curl -v "http://${HOST}:8080/${APP_CTX}/" || true
           exit 1
         '''
       }
@@ -181,7 +123,7 @@ pipeline {
   }
 
   post {
-    success { echo '✅ Deployment successful. Your application should now be accessible.' }
-    failure { echo '❌ Deployment failed. Review the logs from the "Provision Tomcat & Deploy" stage for the exact reason.' }
+    success { echo '✅ Deployment successful. Your application should be accessible!' }
+    failure { echo '❌ Deployment failed. Review the logs from the "Deploy to Tomcat" stage.' }
   }
 }
