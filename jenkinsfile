@@ -1,32 +1,19 @@
 pipeline {
   agent any
-
   environment {
-    // --- CHANGE THESE IF NEEDED ---
-    HOST        = '54.198.173.58'                 // your EC2 public IP/DNS
-    REMOTE_USER = 'ubuntu'                        // SSH user
-    SSH_KEY     = '/var/lib/jenkins/.ssh/app.pem' // private key on Jenkins
-    SERVICE     = 'tomcat9'                       // you have tomcat9
-    WEBAPPS     = '/var/lib/tomcat9/webapps'      // tomcat9 webapps dir
-
-    // App/WAR info (from your pom build)
-    WAR_NAME    = 'hello.war'                     // target/hello.war
-    APP_CTX     = 'hello'                         // served at /hello/
+    WAR_NAME = 'hello.war'      // change if your war name is different
+    PORT     = '8080'
+    RUNNER   = 'jetty-runner-9.4.53.v20231009.jar'
+    RUNNER_URL = "https://repo1.maven.org/maven2/org/eclipse/jetty/jetty-runner/9.4.53.v20231009/${RUNNER}"
   }
-
   stages {
     stage('Checkout') {
       steps {
         checkout scm
-        sh '''
-          set -eux
-          echo "Workspace: $(pwd)"
-          ls -la
-        '''
+        sh 'pwd; ls -la'
       }
     }
-
-    stage('Build with Maven') {
+    stage('Build WAR') {
       steps {
         sh '''
           set -eux
@@ -36,61 +23,42 @@ pipeline {
         '''
       }
     }
-
-    stage('Copy WAR to server') {
+    stage('Fetch Jetty Runner') {
       steps {
         sh '''
           set -eux
-          test -f "${SSH_KEY}"
-          chmod 600 "${SSH_KEY}"
-          scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              "target/${WAR_NAME}" "${REMOTE_USER}@${HOST}:/tmp/${WAR_NAME}"
+          [ -f "${RUNNER}" ] || curl -LO "${RUNNER_URL}"
+          ls -l "${RUNNER}"
         '''
       }
     }
-
-    stage('Deploy to Tomcat9') {
+    stage('Run WAR on 8080') {
       steps {
         sh '''
           set -eux
-          ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "${REMOTE_USER}@${HOST}" bash -lc "
-              set -eux
-              sudo mkdir -p '${WEBAPPS}'
-              sudo systemctl stop '${SERVICE}' || true
-              sudo rm -rf '${WEBAPPS}/${APP_CTX}' '${WEBAPPS}/${WAR_NAME}' || true
-              sudo mv /tmp/${WAR_NAME} '${WEBAPPS}/'
-              # ownership (ignore if no tomcat user on this distro)
-              (id tomcat >/dev/null 2>&1 && sudo chown tomcat:tomcat '${WEBAPPS}/${WAR_NAME}') || true
-              sudo systemctl start '${SERVICE}'
-              sudo systemctl is-active '${SERVICE}'
-              sleep 5
-            "
-        '''
-      }
-    }
+          # Stop any old runner using this port (best-effort)
+          pkill -f "${RUNNER}.*--port ${PORT}" || true
+          sleep 1
 
-    stage('Smoke test') {
-      steps {
-        sh '''
-          set -eux
+          # Start WAR at context path "/" so it’s visible at http://localhost:8080/
+          nohup java -jar "${RUNNER}" --port ${PORT} --path / "target/${WAR_NAME}" \
+            > jetty.log 2>&1 & echo $! > jetty.pid
+
+          # Quick health check
           for i in $(seq 1 20); do
-            if curl -fsS "http://${HOST}:8080/${APP_CTX}/" >/dev/null; then
-              echo "✅ App is up at http://${HOST}:8080/${APP_CTX}/"
+            if curl -fsS "http://localhost:${PORT}/" >/dev/null; then
+              echo "✅ Running at: http://localhost:${PORT}/"
               exit 0
             fi
-            sleep 2
+            sleep 1
           done
-          echo "App did not become healthy in time"
-          curl -v "http://${HOST}:8080/${APP_CTX}/" || true
-          exit 1
+          echo "WAR did not become healthy"; tail -n 200 jetty.log || true; exit 1
         '''
       }
     }
   }
-
   post {
-    success { echo '✅ Deployment successful.' }
-    failure { echo '❌ Deployment failed. Check the Deploy/Smoke logs above.' }
+    success { echo '✅ Your WAR is running on http://localhost:8080/' }
+    failure { echo '❌ Failed. Check jetty.log in the workspace.' }
   }
 }
