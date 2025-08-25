@@ -1,98 +1,96 @@
 pipeline {
-    agent any
-    stages {
-        stage('Checkout') {
-            steps {
-                git branch: 'main', url: 'https://github.com/venkatasai449/hello-web.git'
-                sh 'echo Workspace: $(pwd) && ls -la'
-            }
-        }
+  agent any
+  options { timestamps() }
+  environment {
+    PORT       = '8080'
+    RUNNER     = 'jetty-runner-9.4.53.v20231009.jar'
+    RUNNER_URL = "https://repo1.maven.org/maven2/org/eclipse/jetty/jetty-runner/9.4.53.v20231009/${RUNNER}"
+  }
 
-        stage('Build with Maven') {
-            steps {
-                sh '''
-                  set -eux
-                  mvn -B -DskipTests clean package
-                  echo "Built artifacts:"
-                  ls -l target/
-                '''
-            }
-        }
-
-        stage('Prepare Ansible Files') {
-            steps {
-                sh '''
-                  set -eux
-                  test -f /var/lib/jenkins/.ssh/app.pem
-                  chmod 600 /var/lib/jenkins/.ssh/app.pem
-                  mkdir -p /var/lib/jenkins/.ssh
-                  ssh-keyscan -H <app-ec2-ip> >> ~/.ssh/known_hosts
-                '''
-            }
-        }
-
-        stage('Preflight: Ansible ping') {
-            steps {
-                sh '''
-                  set -eux
-                  ansible -i inventory.ini app -m ping
-                '''
-            }
-        }
-
-        stage('Deploy with Ansible') {
-            steps {
-                writeFile file: 'deploy.yml', text: '''
-                - hosts: app
-                  become: true
-                  tasks:
-                    - name: Ensure Java installed
-                      apt:
-                        name: openjdk-17-jdk
-                        state: present
-                        update_cache: yes
-
-                    - name: Ensure Tomcat9 installed
-                      apt:
-                        name: tomcat9
-                        state: present
-
-                    - name: Copy WAR to Tomcat
-                      copy:
-                        src: target/hello-web-1.0-SNAPSHOT.war
-                        dest: /var/lib/tomcat9/webapps/ROOT.war
-                        owner: tomcat
-                        group: tomcat
-                        mode: '0644'
-
-                    - name: Restart Tomcat
-                      service:
-                        name: tomcat9
-                        state: restarted
-                '''
-                sh '''
-                  set -eux
-                  ansible-playbook -i inventory.ini deploy.yml
-                '''
-            }
-        }
-
-        stage('Smoke test from Jenkins') {
-            steps {
-                sh '''
-                  sleep 10
-                  curl -s http://<app-ec2-ip>:8080/ | grep "CI/CD pipeline is working"
-                '''
-            }
-        }
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        sh 'pwd; ls -la'
+      }
     }
-    post {
-        success {
-            echo "✅ Deployment successful! Access the app at: http://<app-ec2-ip>:8080/"
-        }
-        failure {
-            echo "❌ Deployment failed. Check Ansible/Jenkins logs."
-        }
+
+    stage('Build WAR') {
+      steps {
+        sh '''
+          set -eux
+          mvn -B -DskipTests clean package
+          ls -l target/
+          WAR_PATH="$(ls -1 target/*.war | head -n1 || true)"
+          [ -n "$WAR_PATH" ] || { echo "No WAR found in target/. Did the build create it?"; exit 1; }
+          echo "$WAR_PATH" > WAR_PATH.txt
+        '''
+      }
     }
+
+    stage('Download Jetty Runner') {
+      steps {
+        sh '''
+          set -eux
+          command -v curl >/dev/null 2>&1 || { echo "Install curl on the Jenkins node."; exit 1; }
+          [ -f "${RUNNER}" ] || curl -fL -o "${RUNNER}" "${RUNNER_URL}"
+          ls -l "${RUNNER}"
+        '''
+      }
+    }
+
+    stage('Free port 8080') {
+      steps {
+        sh '''
+          set -eux
+          # Stop any previous Jetty Runner from this job
+          pkill -f "${RUNNER}.*--port ${PORT}" || true
+          sleep 1
+          # Kill anything else on 8080 (best effort)
+          if command -v fuser >/dev/null 2>&1; then fuser -k "${PORT}/tcp" || true; fi
+          # If system Tomcat owns 8080, try to stop it (ignore if not present/allowed)
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl is-active --quiet tomcat9 && (sudo systemctl stop tomcat9 || true) || true
+          fi
+        '''
+      }
+    }
+
+    stage('Run WAR on 8080') {
+      steps {
+        sh '''
+          set -eux
+          WAR_PATH="$(cat WAR_PATH.txt)"
+          rm -f jetty.pid jetty.log
+          nohup java -jar "${RUNNER}" --port "${PORT}" --path / "${WAR_PATH}" > jetty.log 2>&1 & echo $! > jetty.pid
+
+          # Health check until it’s up
+          for i in $(seq 1 30); do
+            if curl -fsS "http://localhost:${PORT}/" >/dev/null; then
+              echo "✅ Running at: http://localhost:${PORT}/"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "WAR did not become healthy in time."
+          tail -n 200 jetty.log || true
+          exit 1
+        '''
+      }
+    }
+  }
+
+  post {
+    success { echo "✅ Your WAR is running on http://localhost:${PORT}/" }
+    failure { echo "❌ Failed. Open jetty.log in the workspace for details." }
+    always  {
+      sh '''
+        echo "--- jetty processes ---"
+        ps -ef | grep jetty-runner | grep -v grep || true
+        echo "--- last log lines ---"
+        tail -n 50 jetty.log || true
+      '''
+    }
+  }
 }
-
