@@ -2,15 +2,18 @@ pipeline {
   agent any
 
   environment {
-    HOST            = '54.198.173.58'
-    REMOTE_USER     = 'ubuntu'
-    SSH_KEY         = '/var/lib/jenkins/.ssh/app.pem'
-    REMOTE_WEBAPPS  = '/var/lib/tomcat9/webapps'
-    WAR_NAME        = 'hello.war'         // built by your pom
-    APP_CONTEXT_DIR = "${REMOTE_WEBAPPS}/hello"
+    // >>> CHANGE ONLY THESE IF NEEDED <<<
+    HOST        = '54.198.173.58'                 // your new instance
+    REMOTE_USER = 'ubuntu'                        // ssh user
+    SSH_KEY     = '/var/lib/jenkins/.ssh/app.pem' // private key path on Jenkins
+
+    // App/WAR details
+    WAR_NAME    = 'hello.war'
+    APP_CTX     = 'hello'     // context path = http://HOST:8080/hello/
   }
 
   stages {
+
     stage('Checkout') {
       steps {
         checkout scm
@@ -29,6 +32,7 @@ pipeline {
           mvn -B -DskipTests clean package
           echo "Built artifacts:"
           ls -l target/
+          test -f "target/${WAR_NAME}"
         '''
       }
     }
@@ -39,36 +43,85 @@ pipeline {
           set -eux
           test -f "${SSH_KEY}"
           chmod 600 "${SSH_KEY}"
-
-          # copy artifact to EC2 (avoid known_hosts hassles)
-          scp -i "${SSH_KEY}" \
-              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               "target/${WAR_NAME}" "${REMOTE_USER}@${HOST}:/tmp/${WAR_NAME}"
         '''
       }
     }
 
-    stage('Deploy & Restart Tomcat') {
+    stage('Provision Tomcat & Deploy') {
       steps {
         sh '''
           set -eux
           ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             "${REMOTE_USER}@${HOST}" '
               set -eux
-              # stop tomcat (ignore if not running)
-              sudo systemctl stop tomcat9 || true
 
-              # clean old app
-              sudo rm -rf "'${APP_CONTEXT_DIR}'" "'${REMOTE_WEBAPPS}'/hello.war" || true
+              # ---- Detect package manager (Ubuntu/Debian vs RHEL/AL2/AL2023) ----
+              if command -v apt-get >/dev/null 2>&1; then
+                export DEBIAN_FRONTEND=noninteractive
+                sudo apt-get update -y
+                sudo apt-get install -y default-jdk-headless || sudo apt-get install -y openjdk-11-jre-headless || true
 
-              # move new war into place and set ownership
-              sudo mv /tmp/'"${WAR_NAME}"' "'${REMOTE_WEBAPPS}'/"
-              sudo chown tomcat:tomcat "'${REMOTE_WEBAPPS}'/'"${WAR_NAME}"'"
+                # Try tomcat10 first (Ubuntu 22.04+), else tomcat9
+                if ! dpkg -s tomcat10 >/dev/null 2>&1; then
+                  sudo apt-get install -y tomcat10 || true
+                fi
+                if ! dpkg -s tomcat10 >/dev/null 2>&1 && ! dpkg -s tomcat9 >/dev/null 2>&1; then
+                  sudo apt-get install -y tomcat9
+                fi
 
-              # start tomcat
-              sudo systemctl start tomcat9
-              sudo systemctl is-active tomcat9
+                # Decide service + webapps path
+                if systemctl list-unit-files | grep -q "^tomcat10\\.service"; then
+                  SVC=tomcat10; WEBAPPS=/var/lib/tomcat10/webapps
+                else
+                  SVC=tomcat9;  WEBAPPS=/var/lib/tomcat9/webapps
+                fi
+                sudo mkdir -p "$WEBAPPS"
+              elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+                PKG=dnf; command -v yum >/dev/null 2>&1 && PKG=yum
+                sudo $PKG -y install java-11-openjdk-headless || sudo $PKG -y install java-17-openjdk-headless || true
+                sudo $PKG -y install tomcat
+
+                SVC=tomcat
+                if [ -d /usr/share/tomcat/webapps ]; then
+                  WEBAPPS=/usr/share/tomcat/webapps
+                elif [ -d /var/lib/tomcat/webapps ]; then
+                  WEBAPPS=/var/lib/tomcat/webapps
+                else
+                  WEBAPPS=/usr/share/tomcat/webapps
+                  sudo mkdir -p "$WEBAPPS"
+                fi
+              else
+                echo "Unsupported OS (need apt, dnf, or yum)" >&2
+                exit 1
+              fi
+
+              echo "Using service: $SVC"
+              echo "Using webapps: $WEBAPPS"
+
+              # ---- Stop Tomcat if running (ignore errors) ----
+              sudo systemctl stop "$SVC" || true
+
+              # ---- Clean old deployment ----
+              sudo rm -rf "$WEBAPPS/'"${APP_CTX}"'" "$WEBAPPS/'"${WAR_NAME}"'" || true
+
+              # ---- Move new WAR ----
+              sudo mv /tmp/'"${WAR_NAME}"' "$WEBAPPS/'"${WAR_NAME}"'"
+
+              # ---- Ownership (if tomcat user exists) ----
+              if id tomcat >/dev/null 2>&1; then
+                sudo chown tomcat:tomcat "$WEBAPPS/'"${WAR_NAME}"'"
+              fi
+
+              # ---- Start & verify ----
+              sudo systemctl start "$SVC"
+              sudo systemctl is-active "$SVC"
               sleep 5
+
+              # Quick log peek (non-fatal)
+              sudo sh -c '"'"'ls -l /var/log | head -n 50 || true; \
+                journalctl -u '"'"'"$SVC"'"'"' -n 50 --no-pager || true'"'"'
             '
         '''
       }
@@ -78,15 +131,15 @@ pipeline {
       steps {
         sh '''
           set -eux
-          for i in $(seq 1 15); do
-            if curl -fsS "http://${HOST}:8080/hello/" >/dev/null; then
+          for i in $(seq 1 20); do
+            if curl -fsS "http://${HOST}:8080/${APP_CTX}/" >/dev/null; then
               echo "App is up ✅"
               exit 0
             fi
             sleep 2
           done
           echo "App did not become healthy in time"
-          curl -v "http://${HOST}:8080/hello/" || true
+          curl -v "http://${HOST}:8080/${APP_CTX}/" || true
           exit 1
         '''
       }
@@ -95,6 +148,6 @@ pipeline {
 
   post {
     success { echo '✅ Deployment successful.' }
-    failure { echo '❌ Deployment failed. Check logs above.' }
+    failure { echo '❌ Deployment failed. Check logs above (Provision/Deploy shows exact reason).' }
   }
 }
