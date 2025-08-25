@@ -1,97 +1,100 @@
 pipeline {
-    agent any
-    stages {
-        stage('Checkout') {
-            steps {
-                git branch: 'main', url: 'https://github.com/venkatasai449/hello-web.git'
-                sh 'echo Workspace: $(pwd) && ls -la'
-            }
-        }
+  agent any
 
-        stage('Build with Maven') {
-            steps {
-                sh '''
-                  set -eux
-                  mvn -B -DskipTests clean package
-                  echo "Built artifacts:"
-                  ls -l target/
-                '''
-            }
-        }
+  environment {
+    HOST            = '54.198.173.58'
+    REMOTE_USER     = 'ubuntu'
+    SSH_KEY         = '/var/lib/jenkins/.ssh/app.pem'
+    REMOTE_WEBAPPS  = '/var/lib/tomcat9/webapps'
+    WAR_NAME        = 'hello.war'         // built by your pom
+    APP_CONTEXT_DIR = "${REMOTE_WEBAPPS}/hello"
+  }
 
-        stage('Prepare Ansible Files') {
-            steps {
-                sh '''
-                  set -eux
-                  test -f /var/lib/jenkins/.ssh/app.pem
-                  chmod 600 /var/lib/jenkins/.ssh/app.pem
-                  mkdir -p /var/lib/jenkins/.ssh
-                  ssh-keyscan -H <app-ec2-ip> >> ~/.ssh/known_hosts
-                '''
-            }
-        }
-
-        stage('Preflight: Ansible ping') {
-            steps {
-                sh '''
-                  set -eux
-                  ansible -i inventory.ini app -m ping
-                '''
-            }
-        }
-
-        stage('Deploy with Ansible') {
-            steps {
-                writeFile file: 'deploy.yml', text: '''
-                - hosts: app
-                  become: true
-                  tasks:
-                    - name: Ensure Java installed
-                      apt:
-                        name: openjdk-17-jdk
-                        state: present
-                        update_cache: yes
-
-                    - name: Ensure Tomcat9 installed
-                      apt:
-                        name: tomcat9
-                        state: present
-
-                    - name: Copy WAR to Tomcat
-                      copy:
-                        src: target/hello-web-1.0-SNAPSHOT.war
-                        dest: /var/lib/tomcat9/webapps/ROOT.war
-                        owner: tomcat
-                        group: tomcat
-                        mode: '0644'
-
-                    - name: Restart Tomcat
-                      service:
-                        name: tomcat9
-                        state: restarted
-                '''
-                sh '''
-                  set -eux
-                  ansible-playbook -i inventory.ini deploy.yml
-                '''
-            }
-        }
-
-        stage('Smoke test from Jenkins') {
-            steps {
-                sh '''
-                  sleep 10
-                  curl -s http://<app-ec2-ip>:8080/ | grep "CI/CD pipeline is working"
-                '''
-            }
-        }
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        sh '''
+          set -eux
+          echo "Workspace: $(pwd)"
+          ls -la
+        '''
+      }
     }
-    post {
-        success {
-            echo "✅ Deployment successful! Access the app at: http://<app-ec2-ip>:8080/"
-        }
-        failure {
-            echo "❌ Deployment failed. Check Ansible/Jenkins logs."
-        }
+
+    stage('Build with Maven') {
+      steps {
+        sh '''
+          set -eux
+          mvn -B -DskipTests clean package
+          echo "Built artifacts:"
+          ls -l target/
+        '''
+      }
     }
+
+    stage('Copy WAR to server') {
+      steps {
+        sh '''
+          set -eux
+          test -f "${SSH_KEY}"
+          chmod 600 "${SSH_KEY}"
+
+          # copy artifact to EC2 (avoid known_hosts hassles)
+          scp -i "${SSH_KEY}" \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              "target/${WAR_NAME}" "${REMOTE_USER}@${HOST}:/tmp/${WAR_NAME}"
+        '''
+      }
+    }
+
+    stage('Deploy & Restart Tomcat') {
+      steps {
+        sh '''
+          set -eux
+          ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${REMOTE_USER}@${HOST}" '
+              set -eux
+              # stop tomcat (ignore if not running)
+              sudo systemctl stop tomcat9 || true
+
+              # clean old app
+              sudo rm -rf "'${APP_CONTEXT_DIR}'" "'${REMOTE_WEBAPPS}'/hello.war" || true
+
+              # move new war into place and set ownership
+              sudo mv /tmp/'"${WAR_NAME}"' "'${REMOTE_WEBAPPS}'/"
+              sudo chown tomcat:tomcat "'${REMOTE_WEBAPPS}'/'"${WAR_NAME}"'"
+
+              # start tomcat
+              sudo systemctl start tomcat9
+              sudo systemctl is-active tomcat9
+              sleep 5
+            '
+        '''
+      }
+    }
+
+    stage('Smoke test from Jenkins') {
+      steps {
+        sh '''
+          set -eux
+          for i in $(seq 1 15); do
+            if curl -fsS "http://${HOST}:8080/hello/" >/dev/null; then
+              echo "App is up ✅"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "App did not become healthy in time"
+          curl -v "http://${HOST}:8080/hello/" || true
+          exit 1
+        '''
+      }
+    }
+  }
+
+  post {
+    success { echo '✅ Deployment successful.' }
+    failure { echo '❌ Deployment failed. Check logs above.' }
+  }
 }
