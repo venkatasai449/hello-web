@@ -1,64 +1,97 @@
 pipeline {
-  agent any
-  environment {
-<<<<<<< HEAD
-    APP_HOST = "54.198.173.58"                 // <-- change to your App EC2 public IP
-    SSH_KEY  = "/var/lib/jenkins/.ssh/app.pem" // key Jenkins uses to SSH to App EC2
-=======
-    APP_HOST = "54.198.173.58"  // put your app_public_ip here
->>>>>>> 0eaed00 (jenkinsfile)
-  }
-  stages {
-    stage('Checkout') {
-      steps {
-        git url: '__YOUR_REPO_URL__', branch: 'main'
-      }
-    }
-    stage('Build with Maven') {
-      steps {
-        sh 'cd hello-web && mvn -B -DskipTests clean package'
-      }
-    }
-    stage('Deploy with Ansible') {
-      steps {
-        sh '''
-        cat > inventory.ini <<EOF
-        [app]
-        app1 ansible_host=${APP_HOST} ansible_user=ubuntu ansible_ssh_private_key_file=/var/lib/jenkins/.ssh/app.pem
-        EOF
+    agent any
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/venkatasai449/hello-web.git'
+                sh 'echo Workspace: $(pwd) && ls -la'
+            }
+        }
 
-        cat > deploy.yml <<EOF
-        - hosts: app
-          become: yes
-          tasks:
-            - name: Install Tomcat 9
-              apt:
-                name:
-                  - tomcat9
-                  - tomcat9-admin
-                state: present
-                update_cache: yes
+        stage('Build with Maven') {
+            steps {
+                sh '''
+                  set -eux
+                  mvn -B -DskipTests clean package
+                  echo "Built artifacts:"
+                  ls -l target/
+                '''
+            }
+        }
 
-            - name: Copy WAR as ROOT.war
-              copy:
-                src: hello-web/target/hello.war
-                dest: /var/lib/tomcat9/webapps/ROOT.war
-                mode: '0644'
+        stage('Prepare Ansible Files') {
+            steps {
+                sh '''
+                  set -eux
+                  test -f /var/lib/jenkins/.ssh/app.pem
+                  chmod 600 /var/lib/jenkins/.ssh/app.pem
+                  mkdir -p /var/lib/jenkins/.ssh
+                  ssh-keyscan -H <app-ec2-ip> >> ~/.ssh/known_hosts
+                '''
+            }
+        }
 
-            - name: Restart Tomcat
-              service:
-                name: tomcat9
-                state: restarted
-        EOF
+        stage('Preflight: Ansible ping') {
+            steps {
+                sh '''
+                  set -eux
+                  ansible -i inventory.ini app -m ping
+                '''
+            }
+        }
 
-        ansible-playbook -i inventory.ini deploy.yml
-        '''
-      }
+        stage('Deploy with Ansible') {
+            steps {
+                writeFile file: 'deploy.yml', text: '''
+                - hosts: app
+                  become: true
+                  tasks:
+                    - name: Ensure Java installed
+                      apt:
+                        name: openjdk-17-jdk
+                        state: present
+                        update_cache: yes
+
+                    - name: Ensure Tomcat9 installed
+                      apt:
+                        name: tomcat9
+                        state: present
+
+                    - name: Copy WAR to Tomcat
+                      copy:
+                        src: target/hello-web-1.0-SNAPSHOT.war
+                        dest: /var/lib/tomcat9/webapps/ROOT.war
+                        owner: tomcat
+                        group: tomcat
+                        mode: '0644'
+
+                    - name: Restart Tomcat
+                      service:
+                        name: tomcat9
+                        state: restarted
+                '''
+                sh '''
+                  set -eux
+                  ansible-playbook -i inventory.ini deploy.yml
+                '''
+            }
+        }
+
+        stage('Smoke test from Jenkins') {
+            steps {
+                sh '''
+                  sleep 10
+                  curl -s http://<app-ec2-ip>:8080/ | grep "CI/CD pipeline is working"
+                '''
+            }
+        }
     }
-  }
-  post {
-    success {
-      echo "App URL: http://${APP_HOST}:8080/"
+    post {
+        success {
+            echo "✅ Deployment successful! Access the app at: http://<app-ec2-ip>:8080/"
+        }
+        failure {
+            echo "❌ Deployment failed. Check Ansible/Jenkins logs."
+        }
     }
-  }
 }
