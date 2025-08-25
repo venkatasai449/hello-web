@@ -1,80 +1,179 @@
 pipeline {
   agent any
-  options { timestamps() }
+
   environment {
-    PORT       = '8080'
-    RUNNER     = 'jetty-runner-9.4.53.v20231009.jar'
-    RUNNER_URL = "https://repo1.maven.org/maven2/org/eclipse/jetty/jetty-runner/9.4.53.v20231009/${RUNNER}"
+    // >>> CHANGE ONLY THESE IF NEEDED <<<
+    HOST        = '54.198.173.58'           // 💡 Your new instance IP address
+    REMOTE_USER = 'ubuntu'                  // 💡 SSH user for the remote server
+    SSH_KEY     = '/var/lib/jenkins/.ssh/app.pem' // 💡 Private key path on Jenkins for SSH access
+
+    // App/WAR details
+    WAR_NAME    = 'hello.war' // The name of your WAR file
+    APP_CTX     = 'hello'     // The context path for your application (e.g., http://HOST:8080/hello/)
   }
 
   stages {
+
     stage('Checkout') {
       steps {
+        // Fetches your source code from the configured SCM (e.g., Git)
         checkout scm
-        sh 'pwd; ls -la'
+        sh '''
+          set -eux
+          echo "Workspace: $(pwd)"
+          ls -la
+        '''
       }
     }
 
-    stage('Build WAR') {
+    stage('Build with Maven') {
       steps {
+        // Builds the project using Maven, skipping tests, and packages it into a WAR file
         sh '''
           set -eux
           mvn -B -DskipTests clean package
+          echo "Built artifacts:"
           ls -l target/
-          WAR_PATH="$(ls -1 target/*.war | head -n1 || true)"
-          [ -n "$WAR_PATH" ] || { echo "No WAR found in target/. Did the build create it?"; exit 1; }
-          echo "$WAR_PATH" > WAR_PATH.txt
+          test -f "target/${WAR_NAME}" # Verifies that the WAR file was created
         '''
       }
     }
 
-    stage('Download Jetty Runner') {
+    stage('Copy WAR to server') {
       steps {
+        // Copies the generated WAR file from Jenkins workspace to the remote server's /tmp directory
         sh '''
           set -eux
-          command -v curl >/dev/null 2>&1 || { echo "Install curl on the Jenkins node."; exit 1; }
-          [ -f "${RUNNER}" ] || curl -fL -o "${RUNNER}" "${RUNNER_URL}"
-          ls -l "${RUNNER}"
+          test -f "${SSH_KEY}"
+          chmod 600 "${SSH_KEY}" # Sets appropriate permissions for the SSH key
+          scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
+              "target/${WAR_NAME}" "${REMOTE_USER}@${HOST}:/tmp/${WAR_NAME}"
         '''
       }
     }
 
-    stage('Free port 8080') {
+    stage('Provision Tomcat & Deploy') {
       steps {
+        // Connects to the remote server via SSH and performs Tomcat installation and application deployment
         sh '''
           set -eux
-          # Stop any previous Jetty Runner from this job
-          pkill -f "${RUNNER}.*--port ${PORT}" || true
-          sleep 1
-          # Kill anything else on 8080 (best effort)
-          if command -v fuser >/dev/null 2>&1; then fuser -k "${PORT}/tcp" || true; fi
-          # If system Tomcat owns 8080, try to stop it (ignore if not present/allowed)
-          if command -v systemctl >/dev/null 2>&1; then
-            systemctl is-active --quiet tomcat9 && (sudo systemctl stop tomcat9 || true) || true
-          fi
+          ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
+            "${REMOTE_USER}@${HOST}" '
+              set -eux
+
+              # ---- Detect package manager (Ubuntu/Debian vs RHEL/AL2/AL2023) ----
+              # This block intelligently detects the OS and installs Java and Tomcat
+              # based on whether 'apt-get' or 'dnf'/'yum' is available.
+              if command -v apt-get >/dev/null 2>&1; then
+                export DEBIAN_FRONTEND=noninteractive
+                sudo apt-get update -y
+                sudo apt-get install -y default-jdk-headless || sudo apt-get install -y openjdk-11-jre-headless || true
+
+                if ! dpkg -s tomcat10 >/dev/null 2>&1; then
+                  sudo apt-get install -y tomcat10 || true
+                fi
+                if ! dpkg -s tomcat10 >/dev/null 2>&1 && ! dpkg -s tomcat9 >/dev/null 2>&1; then
+                  sudo apt-get install -y tomcat9
+                fi
+
+                if systemctl list-unit-files | grep -q "^tomcat10\\.service"; then
+                  SVC=tomcat10; WEBAPPS=/var/lib/tomcat10/webapps
+                else
+                  SVC=tomcat9;  WEBAPPS=/var/lib/tomcat9/webapps
+                fi
+                sudo mkdir -p "$WEBAPPS"
+              elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+                PKG=dnf; command -v yum >/dev/null 2>&1 && PKG=yum
+                sudo $PKG -y install java-11-openjdk-headless || sudo $PKG -y install java-17-openjdk-headless || true
+                sudo $PKG -y install tomcat
+
+                SVC=tomcat
+                if [ -d /usr/share/tomcat/webapps ]; then
+                  WEBAPPS=/usr/share/tomcat/webapps
+                elif [ -d /var/lib/tomcat/webapps ]; then
+                  WEBAPPS=/var/lib/tomcat/webapps
+                else
+                  WEBAPPS=/usr/share/tomcat/webapps
+                  sudo mkdir -p "$WEBAPPS"
+                fi
+              else
+                echo "Unsupported OS (need apt, dnf, or yum)" >&2
+                exit 1
+              fi
+
+              echo "Using Tomcat service: $SVC"
+              echo "Using webapps directory: $WEBAPPS"
+
+              # ---- Stop Tomcat if running (ignore errors) ----
+              sudo systemctl stop "$SVC" || true
+
+              # ---- Clean old deployment ----
+              # Removes any previously deployed version of the application
+              sudo rm -rf "$WEBAPPS/'"${APP_CTX}"'" "$WEBAPPS/'"${WAR_NAME}"'" || true
+
+              # ---- Ensure webapps directory has correct permissions for Tomcat to unpack WARs ----
+              # This is CRUCIAL for successful deployment. Tomcat needs write access to its webapps directory.
+              TOMCAT_RUN_USER=""
+              TOMCAT_RUN_GROUP=""
+
+              if id tomcat >/dev/null 2>&1; then
+                  TOMCAT_RUN_USER="tomcat"
+                  TOMCAT_RUN_GROUP=$(id -gn tomcat || echo "tomcat")
+              elif id www-data >/dev/null 2>&1; then # Common for web servers on Debian/Ubuntu
+                  TOMCAT_RUN_USER="www-data"
+                  TOMCAT_RUN_GROUP=$(id -gn www-data || echo "www-data")
+              fi
+
+              if [ -n "$TOMCAT_RUN_USER" ]; then
+                  echo "Setting ownership of $WEBAPPS to $TOMCAT_RUN_USER:$TOMCAT_RUN_GROUP"
+                  sudo chown -R "$TOMCAT_RUN_USER":"$TOMCAT_RUN_GROUP" "$WEBAPPS"
+                  sudo chmod -R u+rwx,g+rwx,o+rx "$WEBAPPS" # Grant read/write/execute for owner and group
+              else
+                  echo "⚠️ Warning: No suitable Tomcat user ('tomcat' or 'www-data') found. Skipping explicit ownership change for $WEBAPPS. Deployment might fail due to permissions."
+              fi
+
+              # ---- Move new WAR ----
+              # Moves the WAR file into Tomcat's webapps directory for automatic deployment
+              sudo mv /tmp/'"${WAR_NAME}"' "$WEBAPPS/'"${WAR_NAME}"'"
+              # Explicitly sets ownership of the new WAR file to the Tomcat user/group
+              if [ -n "$TOMCAT_RUN_USER" ]; then
+                  sudo chown "$TOMCAT_RUN_USER":"$TOMCAT_RUN_GROUP" "$WEBAPPS/'"${WAR_NAME}"'" || true
+              fi
+
+              # ---- Start & verify Tomcat ----
+              sudo systemctl start "$SVC"
+              sudo systemctl is-active "$SVC"
+              sleep 10 # Gives Tomcat more time to start up and unpack the WAR
+
+              # Quick log peek (non-fatal) - show more relevant logs for debugging
+              echo "--- Checking Tomcat service status and logs ---"
+              sudo systemctl status "$SVC" --no-pager || true
+              echo "--- Last 200 lines of Tomcat service logs ---"
+              sudo journalctl -u "$SVC" --since "5 minutes ago" -n 200 --no-pager || true
+              echo "--- Listing webapps directory contents after deployment attempt ---"
+              sudo ls -la "$WEBAPPS" || true # Shows if 'hello' directory was created
+            '
         '''
       }
     }
 
-    stage('Run WAR on 8080') {
+    stage('Smoke test from Jenkins') {
       steps {
+        // Periodically checks if the deployed application is accessible and responsive
         sh '''
           set -eux
-          WAR_PATH="$(cat WAR_PATH.txt)"
-          rm -f jetty.pid jetty.log
-          nohup java -jar "${RUNNER}" --port "${PORT}" --path / "${WAR_PATH}" > jetty.log 2>&1 & echo $! > jetty.pid
-
-          # Health check until it’s up
-          for i in $(seq 1 30); do
-            if curl -fsS "http://localhost:${PORT}/" >/dev/null; then
-              echo "✅ Running at: http://localhost:${PORT}/"
+          # Loop for a bit longer to give the app time to fully deploy and become responsive
+          for i in $(seq 1 30); do # Increased loop count for more robust checking
+            # -f (fail silently), -s (silent), -S (show errors if -s is used)
+            if curl -fsS "http://${HOST}:8080/${APP_CTX}/" >/dev/null; then
+              echo "App is up ✅"
               exit 0
             fi
-            sleep 1
+            echo "Attempt $i: App not yet healthy at http://${HOST}:8080/${APP_CTX}/. Retrying in 2 seconds..."
+            sleep 2
           done
-
-          echo "WAR did not become healthy in time."
-          tail -n 200 jetty.log || true
+          echo "App did not become healthy in time. Final curl attempt for debugging:"
+          curl -v "http://${HOST}:8080/${APP_CTX}/" || true # Verbose curl to aid debugging
           exit 1
         '''
       }
@@ -82,15 +181,7 @@ pipeline {
   }
 
   post {
-    success { echo "✅ Your WAR is running on http://localhost:${PORT}/" }
-    failure { echo "❌ Failed. Open jetty.log in the workspace for details." }
-    always  {
-      sh '''
-        echo "--- jetty processes ---"
-        ps -ef | grep jetty-runner | grep -v grep || true
-        echo "--- last log lines ---"
-        tail -n 50 jetty.log || true
-      '''
-    }
+    success { echo '✅ Deployment successful. Your application should now be accessible.' }
+    failure { echo '❌ Deployment failed. Review the logs from the "Provision Tomcat & Deploy" stage for the exact reason.' }
   }
 }
