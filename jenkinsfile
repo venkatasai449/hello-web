@@ -1,121 +1,145 @@
 pipeline {
   agent any
+  options { timestamps() }
 
   environment {
-    // >>> CHANGE ONLY THESE IF NEEDED <<<
-    HOST        = '54.198.173.58'           // 💡 Your new instance IP address
-    REMOTE_USER = 'ubuntu'                  // 💡 SSH user for the remote server
-    SSH_KEY     = '/var/lib/jenkins/.ssh/app.pem' // 💡 Private key path on Jenkins for SSH access
-
-    // App/WAR details
-    WAR_NAME    = 'hello.war' // The name of your WAR file
-    APP_CTX     = 'hello'     // The context path for your application (e.g., http://HOST:8080/hello/)
+    APP_HOST    = '54.198.173.58'          // <-- CHANGE to your app node IP
+    REMOTE_USER = 'ubuntu'                 // default for Ubuntu on AWS
+    SSH_KEY     = '/var/lib/jenkins/.ssh/app.pem'
+    WAR_NAME    = 'hello.war'              // <-- CHANGE if your WAR is named differently
   }
 
   stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        sh 'set -eu; echo "Workspace: $(pwd)"; ls -la'
+      }
+    }
 
-    stage('Checkout & Build') {
+    stage('Build WAR') {
       steps {
         sh '''
-          set -eux
-          echo "Workspace: $(pwd)"
-          checkout scm
-          ls -la
-          echo "Building with Maven..."
+          set -eu
           mvn -B -DskipTests clean package
-          echo "Built artifacts:"
-          ls -l target/
-          test -f "target/${WAR_NAME}"
+          echo "Built artifacts:"; ls -l target/
+          test -f "target/${WAR_NAME}" || { echo "Expected target/${WAR_NAME} not found"; exit 1; }
         '''
       }
     }
 
-    stage('Deploy to Tomcat') {
+    stage('Copy WAR to app node') {
       steps {
         sh '''
-          set -eux
-          test -f "${SSH_KEY}"
+          set -eu
+          test -f "${SSH_KEY}" || { echo "SSH key not found at ${SSH_KEY}"; exit 1; }
           chmod 600 "${SSH_KEY}"
-
-          # Copy WAR to remote server
-          echo "Copying ${WAR_NAME} to remote server..."
-          scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-              "target/${WAR_NAME}" "${REMOTE_USER}@${HOST}:/tmp/${WAR_NAME}"
-
-          # SSH into remote server for provisioning and deployment
-          ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\
-            "${REMOTE_USER}@${HOST}" '
-              set -eux
-              export DEBIAN_FRONTEND=noninteractive
-
-              # Install Java and Tomcat (assuming Ubuntu/Debian and tomcat9)
-              echo "Updating packages and installing Java/Tomcat9..."
-              sudo apt-get update -y
-              sudo apt-get install -y openjdk-11-jre-headless tomcat9 || true
-
-              # Define Tomcat service and webapps directory
-              SVC=tomcat9
-              WEBAPPS=/var/lib/tomcat9/webapps
-              TOMCAT_RUN_USER="tomcat" # Standard user for tomcat9 on Ubuntu/Debian
-              TOMCAT_RUN_GROUP="tomcat" # Standard group for tomcat9 on Ubuntu/Debian
-
-              # Fallback for www-data if tomcat user isn't found
-              if ! id -u "$TOMCAT_RUN_USER" >/dev/null 2>&1; then
-                  TOMCAT_RUN_USER="www-data"
-                  TOMCAT_RUN_GROUP="www-data"
-              fi
-              echo "Using Tomcat service: $SVC, Webapps: $WEBAPPS, User: $TOMCAT_RUN_USER"
-
-              # Stop Tomcat
-              echo "Stopping Tomcat service..."
-              sudo systemctl stop "$SVC" || true
-              sleep 5
-
-              # Clean old deployment and ensure webapps permissions
-              echo "Cleaning old deployment and setting permissions for $WEBAPPS..."
-              sudo rm -rf "$WEBAPPS/'"${APP_CTX}"'" "$WEBAPPS/'"${WAR_NAME}"'" || true
-              sudo chown -R "$TOMCAT_RUN_USER":"$TOMCAT_RUN_GROUP" "$WEBAPPS"
-              sudo chmod -R u+rwx,g+rwx,o+rx "$WEBAPPS"
-              
-              # Move new WAR to webapps
-              echo "Moving ${WAR_NAME} to $WEBAPPS..."
-              sudo mv /tmp/'"${WAR_NAME}"' "$WEBAPPS/'"${WAR_NAME}"'"
-              sudo chown "$TOMCAT_RUN_USER":"$TOMCAT_RUN_GROUP" "$WEBAPPS/'"${WAR_NAME}"'"
-
-              # Start Tomcat
-              echo "Starting Tomcat service..."
-              sudo systemctl start "$SVC"
-              sleep 15
-
-              # Verify deployment
-              echo "Verifying WAR unpacking..."
-              if [ -d "$WEBAPPS/'"${APP_CTX}"'" ]; then
-                  echo "✅ WAR unpacked successfully: $WEBAPPS/'"${APP_CTX}"'"
-              else
-                  echo "❌ WAR not unpacked to $WEBAPPS/'"${APP_CTX}"'. Check logs for errors."
-                  sudo journalctl -u "$SVC" --since "30 seconds ago" -n 50 --no-pager | grep -E "ERROR|WARN|catalina.log" || true
-                  exit 1
-              fi
-            '
+          scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "target/${WAR_NAME}" "${REMOTE_USER}@${APP_HOST}:/tmp/ROOT.war"
         '''
       }
     }
 
-    stage('Smoke test') {
+    stage('Deploy on app node & restart Tomcat') {
       steps {
         sh '''
-          set -eux
-          echo "Initiating smoke test for http://${HOST}:8080/${APP_CTX}/"
-          for i in $(seq 1 30); do # Increased attempts for robustness
-            if curl -fsS "http://${HOST}:8080/${APP_CTX}/" >/dev/null; then
-              echo "App is up ✅"
+          set -eu
+          ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${REMOTE_USER}@${APP_HOST}" <<'REMOTE'
+set -eu
+
+# Detect OS and ensure Tomcat is installed
+if [ -f /etc/os-release ]; then
+  . /etc/os-release
+else
+  ID=""
+fi
+
+SERVICE=""
+WEBAPPS=""
+GROUP="tomcat"
+USER="tomcat"
+
+case "$ID" in
+  ubuntu|debian)
+    # Install Tomcat 9 if missing
+    if ! command -v systemctl >/dev/null 2>&1 || ! systemctl list-unit-files | grep -q '^tomcat9\\.service'; then
+      sudo apt-get update -y
+      sudo apt-get install -y tomcat9 curl
+    else
+      sudo apt-get install -y curl || true
+    fi
+    SERVICE="tomcat9"
+    WEBAPPS="/var/lib/tomcat9/webapps"
+    USER="tomcat"
+    GROUP="tomcat"
+    ;;
+  amzn|rhel|centos|rocky|almalinux|fedora)
+    # Install Tomcat (package name is 'tomcat')
+    if ! command -v systemctl >/dev/null 2>&1 || ! systemctl list-unit-files | grep -q '^tomcat\\.service'; then
+      if command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y tomcat curl
+      else
+        sudo yum install -y tomcat curl
+      fi
+    else
+      (command -v dnf >/dev/null 2>&1 && sudo dnf install -y curl) || sudo yum install -y curl || true
+    fi
+    SERVICE="tomcat"
+    WEBAPPS="/var/lib/tomcat/webapps"
+    USER="tomcat"
+    GROUP="tomcat"
+    ;;
+  *)
+    # Fallback: try Ubuntu defaults
+    if ! systemctl list-unit-files | grep -q '^tomcat9\\.service'; then
+      sudo apt-get update -y
+      sudo apt-get install -y tomcat9 curl
+    fi
+    SERVICE="tomcat9"
+    WEBAPPS="/var/lib/tomcat9/webapps"
+    USER="tomcat"
+    GROUP="tomcat"
+    ;;
+esac
+
+# Ensure webapps dir exists
+sudo mkdir -p "$WEBAPPS"
+
+# Stop Tomcat if running
+sudo systemctl stop "$SERVICE" || true
+
+# Clean old ROOT and deploy new WAR as ROOT.war
+sudo rm -rf "$WEBAPPS/ROOT" "$WEBAPPS/ROOT.war" || true
+sudo mv /tmp/ROOT.war "$WEBAPPS/ROOT.war"
+sudo chown "$USER:$GROUP" "$WEBAPPS/ROOT.war"
+
+# Start Tomcat and wait a bit
+sudo systemctl start "$SERVICE"
+sudo systemctl is-active "$SERVICE"
+sleep 8
+
+# Quick local health check on the node (optional)
+curl -fsS http://localhost:8080/ >/dev/null || { echo "Local curl failed"; exit 1; }
+REMOTE
+        '''
+      }
+    }
+
+    stage('Smoke test from Jenkins') {
+      steps {
+        sh '''
+          set -eu
+          # Try up to ~30s for Tomcat to explode the WAR
+          for i in $(seq 1 10); do
+            if curl -fsS "http://${APP_HOST}:8080/" >/dev/null; then
+              echo "Smoke test OK"
               exit 0
             fi
-            echo "Attempt $i: App not yet healthy. Retrying in 2 seconds..."
-            sleep 2
+            echo "Waiting for app... ($i/10)"
+            sleep 3
           done
-          echo "App did not become healthy in time. Final curl attempt for debugging:"
-          curl -v "http://${HOST}:8080/${APP_CTX}/" || true
+          echo "Smoke test FAILED"
           exit 1
         '''
       }
@@ -123,7 +147,7 @@ pipeline {
   }
 
   post {
-    success { echo '✅ Deployment successful. Your application should be accessible!' }
-    failure { echo '❌ Deployment failed. Review the logs from the "Deploy to Tomcat" stage.' }
+    success { echo '✅ Deployed successfully. Visit: http://' + env.APP_HOST + ':8080/' }
+    failure { echo '❌ Deployment failed. Check the first error above.' }
   }
 }
