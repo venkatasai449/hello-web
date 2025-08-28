@@ -3,135 +3,151 @@ pipeline {
   options { timestamps() }
 
   environment {
-    APP_HOST = '35.89.163.155'        // e.g. 35.89.163.155
-    APP_USER = 'ubuntu'                         // e.g. ubuntu (AWS Ubuntu) or ec2-user (Amazon Linux)
-    SSH_KEY  = '/var/lib/jenkins/.ssh/app.pem'  // private key path on Jenkins box
-    CONTEXT  = 'addressbook'                          // final URL: http://IP:8080/hello/
-    WAR_NAME = 'addressbook.war'                      // produced by your pom.xml
+    APP_HOST    = '35.89.163.155'          // <-- CHANGE to your app node IP
+    REMOTE_USER = 'ubuntu'                 // default for Ubuntu on AWS
+    SSH_KEY     = '/var/lib/jenkins/.ssh/app.pem'
+    WAR_NAME    = 'addressbook.war'              // <-- CHANGE if your WAR is named differently
   }
 
   stages {
     stage('Checkout') {
-      steps { checkout scm }
+      steps {
+        checkout scm
+        sh 'set -eu; echo "Workspace: $(pwd)"; ls -la'
+      }
     }
 
     stage('Build WAR') {
       steps {
-        sh 'mvn -B -DskipTests clean package'
-        sh 'ls -l target'
+        sh '''
+          set -eu
+          mvn -B -DskipTests clean package
+          echo "Built artifacts:"; ls -l target/
+          test -f "target/${WAR_NAME}" || { echo "Expected target/${WAR_NAME} not found"; exit 1; }
+        '''
       }
     }
 
     stage('Copy WAR to app node') {
       steps {
         sh '''
-          set -eux
-          test -f "$SSH_KEY"
-          chmod 600 "$SSH_KEY"
-          scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "target/$WAR_NAME" "$APP_USER@$APP_HOST:/tmp/$WAR_NAME"
+          set -eu
+          test -f "${SSH_KEY}" || { echo "SSH key not found at ${SSH_KEY}"; exit 1; }
+          chmod 600 "${SSH_KEY}"
+          scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "target/${WAR_NAME}" "${REMOTE_USER}@${APP_HOST}:/tmp/ROOT.war"
         '''
       }
     }
 
-    stage('Install/Detect Tomcat & Deploy') {
+    stage('Deploy on app node & restart Tomcat') {
       steps {
         sh '''
-          set -eux
-          ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$APP_USER@$APP_HOST" '
-            set -eux
+          set -eu
+          ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${REMOTE_USER}@${APP_HOST}" <<'REMOTE'
+set -eu
 
-            # Figure out package manager
-            if command -v apt-get >/dev/null 2>&1; then
-              PKG=apt
-            elif command -v dnf >/dev/null 2>&1; then
-              PKG=dnf
-            elif command -v yum >/dev/null 2>&1; then
-              PKG=yum
-            else
-              PKG=none
-            fi
+# Detect OS and ensure Tomcat is installed
+if [ -f /etc/os-release ]; then
+  . /etc/os-release
+else
+  ID=""
+fi
 
-            # If no webapps dir is found, install Tomcat via package manager
-            find_webapps() {
-              if [ -d /var/lib/tomcat9/webapps ]; then echo /var/lib/tomcat9/webapps; return; fi
-              if [ -d /var/lib/tomcat/webapps ];  then echo /var/lib/tomcat/webapps;  return; fi
-              if [ -d /usr/share/tomcat/webapps ]; then echo /usr/share/tomcat/webapps; return; fi
-              if [ -d /opt/tomcat/webapps ];      then echo /opt/tomcat/webapps;      return; fi
-              # try common apache-tomcat tar installs
-              T=$(echo /usr/share/apache-tomcat*/webapps | awk "{print \$1}")
-              if [ -d "$T" ]; then echo "$T"; return; fi
-              echo ""
-            }
+SERVICE=""
+WEBAPPS=""
+GROUP="tomcat"
+USER="tomcat"
 
-            WEBAPPS=$(find_webapps)
-            if [ -z "$WEBAPPS" ] && [ "$PKG" != none ]; then
-              if [ "$PKG" = apt ]; then
-                sudo apt-get update -y
-                sudo apt-get install -y tomcat9
-              elif [ "$PKG" = dnf ]; then
-                sudo dnf install -y tomcat
-              else
-                sudo yum install -y tomcat
-              fi
-              # re-detect after install
-              WEBAPPS=$(find_webapps)
-            fi
+case "$ID" in
+  ubuntu|debian)
+    # Install Tomcat 9 if missing
+    if ! command -v systemctl >/dev/null 2>&1 || ! systemctl list-unit-files | grep -q '^tomcat9\\.service'; then
+      sudo apt-get update -y
+      sudo apt-get install -y tomcat9 curl
+    else
+      sudo apt-get install -y curl || true
+    fi
+    SERVICE="tomcat9"
+    WEBAPPS="/var/lib/tomcat9/webapps"
+    USER="tomcat"
+    GROUP="tomcat"
+    ;;
+  amzn|rhel|centos|rocky|almalinux|fedora)
+    # Install Tomcat (package name is 'tomcat')
+    if ! command -v systemctl >/dev/null 2>&1 || ! systemctl list-unit-files | grep -q '^tomcat\\.service'; then
+      if command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y tomcat curl
+      else
+        sudo yum install -y tomcat curl
+      fi
+    else
+      (command -v dnf >/dev/null 2>&1 && sudo dnf install -y curl) || sudo yum install -y curl || true
+    fi
+    SERVICE="tomcat"
+    WEBAPPS="/var/lib/tomcat/webapps"
+    USER="tomcat"
+    GROUP="tomcat"
+    ;;
+  *)
+    # Fallback: try Ubuntu defaults
+    if ! systemctl list-unit-files | grep -q '^tomcat9\\.service'; then
+      sudo apt-get update -y
+      sudo apt-get install -y tomcat9 curl
+    fi
+    SERVICE="tomcat9"
+    WEBAPPS="/var/lib/tomcat9/webapps"
+    USER="tomcat"
+    GROUP="tomcat"
+    ;;
+esac
 
-            if [ -z "$WEBAPPS" ]; then
-              echo "ERROR: Could not find Tomcat webapps directory after install." >&2
-              exit 1
-            fi
+# Ensure webapps dir exists
+sudo mkdir -p "$WEBAPPS"
 
-            # Determine service name
-            if systemctl list-unit-files | grep -q "^tomcat9\\.service"; then
-              SVC=tomcat9
-            elif systemctl list-unit-files | grep -q "^tomcat\\.service"; then
-              SVC=tomcat
-            else
-              # Fallback guess
-              SVC=tomcat9
-            fi
+# Stop Tomcat if running
+sudo systemctl stop "$SERVICE" || true
 
-            echo "Using WEBAPPS=$WEBAPPS  SVC=$SVC"
+# Clean old ROOT and deploy new WAR as ROOT.war
+sudo rm -rf "$WEBAPPS/ROOT" "$WEBAPPS/ROOT.war" || true
+sudo mv /tmp/ROOT.war "$WEBAPPS/ROOT.war"
+sudo chown "$USER:$GROUP" "$WEBAPPS/ROOT.war"
 
-            # Stop (ignore if not running)
-            sudo systemctl stop "$SVC" || true
+# Start Tomcat and wait a bit
+sudo systemctl start "$SERVICE"
+sudo systemctl is-active "$SERVICE"
+sleep 8
 
-            # Clean previous deploy
-            sudo rm -rf "$WEBAPPS/$CONTEXT" "$WEBAPPS/$CONTEXT.war" || true
-
-            # Move new WAR
-            sudo mv "/tmp/$WAR_NAME" "$WEBAPPS/$CONTEXT.war"
-
-            # Fix ownership if a tomcat user exists
-            if id tomcat >/dev/null 2>&1; then
-              sudo chown tomcat:tomcat "$WEBAPPS/$CONTEXT.war"
-            elif id tomcat9 >/dev/null 2>&1; then
-              sudo chown tomcat9:tomcat9 "$WEBAPPS/$CONTEXT.war"
-            fi
-
-            # Start and wait a moment for auto-deploy
-            sudo systemctl start "$SVC"
-            sudo systemctl is-active "$SVC"
-            sleep 6
-          '
+# Quick local health check on the node (optional)
+curl -fsS http://localhost:8080/ >/dev/null || { echo "Local curl failed"; exit 1; }
+REMOTE
         '''
       }
     }
 
-    stage('Smoke test') {
+    stage('Smoke test from Jenkins') {
       steps {
         sh '''
-          set -eux
-          curl -fsS "http://$APP_HOST:8080/$CONTEXT"  || curl -fsS "http://$APP_HOST:8080/$CONTEXT/" || true
-          echo "✅ Deployed to: http://$APP_HOST:8080/$CONTEXT/"
+          set -eu
+          # Try up to ~30s for Tomcat to explode the WAR
+          for i in $(seq 1 10); do
+            if curl -fsS "http://${APP_HOST}:8080/" >/dev/null; then
+              echo "Smoke test OK"
+              exit 0
+            fi
+            echo "Waiting for app... ($i/10)"
+            sleep 3
+          done
+          echo "Smoke test FAILED"
+          exit 1
         '''
       }
     }
   }
 
   post {
-    failure { echo "❌ Deployment failed. Check the stage logs above." }
+    success { echo '✅ Deployed successfully. Visit: http://' + env.APP_HOST + ':8080/' }
+    failure { echo '❌ Deployment failed. Check the first error above.' }
   }
 }
