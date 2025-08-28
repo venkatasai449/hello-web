@@ -1,12 +1,12 @@
-pipeline {
+﻿pipeline {
   agent any
   options { timestamps() }
 
   environment {
-    APP_HOST    = '54.198.173.58'          // <-- CHANGE to your app node IP
+    APP_HOST    = '35.89.163.155'          // <-- CHANGE to your app node IP
     REMOTE_USER = 'ubuntu'                 // default for Ubuntu on AWS
     SSH_KEY     = '/var/lib/jenkins/.ssh/app.pem'
-    WAR_NAME    = 'hello.war'              // <-- CHANGE if your WAR is named differently
+    WAR_NAME    = 'addressbook.war'              // <-- CHANGE if your WAR is named differently
   }
 
   stages {
