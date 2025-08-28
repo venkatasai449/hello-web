@@ -3,64 +3,47 @@ pipeline {
   options { timestamps() }
 
   environment {
-    // ==== CHANGE THESE FOR YOUR INSTANCE ====
-    APP_HOST   = '35.89.163.155'                     // your app server public IP/DNS
-    SSH_KEY    = '/var/lib/jenkins/.ssh/app.pem'     // private key path on Jenkins node
-    SSH_USER   = 'ubuntu'                            // EC2 Ubuntu AMI default
-    PORT       = '8080'
-    // If your project builds a different file, change this:
-    WAR_NAME   = 'addressbook.war'                   // produced in target/
-    // App context: 'addressbook' -> http://host:8080/addressbook/
-    // Use 'ROOT' if you want it at http://host:8080/
-    CONTEXT    = 'addressbook'
+    APP_HOST = '35.89.163.155'      // e.g. 35.89.163.155
+    APP_USER = 'ubuntu'                         // 'ubuntu' for Ubuntu AMIs, 'ec2-user' for Amazon Linux
+    SSH_KEY  = '/var/lib/jenkins/.ssh/app.pem'  // path on the Jenkins box
+    CONTEXT  = 'addressbook'                    // URL context => http://IP:8080/addressbook/
+    WAR_NAME = 'addressbook.war'                // produced by your pom.xml
   }
 
   stages {
     stage('Checkout') {
-      steps {
-        checkout([$class: 'GitSCM',
-          branches: [[name: '*/main']],
-          userRemoteConfigs: [[url: 'https://github.com/venkatasai449/hello-web']]
-        ])
-      }
+      steps { checkout scm }
     }
 
     stage('Build WAR') {
       steps {
-        sh '''
-          set -Eeuo pipefail
-          mvn -B -DskipTests clean package
-          echo "Built artifacts:"
-          ls -lh target || true
-          test -f "target/${WAR_NAME}" || { echo "ERROR: target/${WAR_NAME} not found"; exit 1; }
-        '''
+        sh 'mvn -B -DskipTests clean package'
+        sh 'ls -l target'
       }
     }
 
     stage('Copy WAR to app node') {
       steps {
         sh '''
-          set -Eeuo pipefail
-          test -f "${SSH_KEY}" || { echo "ERROR: SSH key not found at ${SSH_KEY}"; exit 1; }
-          chmod 600 "${SSH_KEY}"
-          scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "target/${WAR_NAME}" "${SSH_USER}@${APP_HOST}:/tmp/${WAR_NAME}"
+          set -eux
+          test -f "$SSH_KEY"
+          chmod 600 "$SSH_KEY"
+          scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "target/$WAR_NAME" "$APP_USER@$APP_HOST:/tmp/$WAR_NAME"
         '''
       }
     }
 
-    stage('Install Java/Tomcat & Deploy') {
+    stage('Install/Detect Tomcat & Deploy') {
       steps {
         sh '''
-          set -Eeuo pipefail
-          export DEBIAN_FRONTEND=noninteractive
+          set -eux
+          # pass env vars into remote shell, then run our script via heredoc
+          ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+             "$APP_USER@$APP_HOST" "CONTEXT='$CONTEXT' WAR_NAME='$WAR_NAME' DEBIAN_FRONTEND=noninteractive bash -s" <<'EOS'
+set -eux
 
-          ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "${SSH_USER}@${APP_HOST}" "bash -s" << 'REMOTE'
-set -Eeuo pipefail
-export DEBIAN_FRONTEND=noninteractive
-
-# Detect package manager
+# Identify package manager
 if command -v apt-get >/dev/null 2>&1; then
   PKG=apt
 elif command -v dnf >/dev/null 2>&1; then
@@ -71,47 +54,26 @@ else
   PKG=none
 fi
 
-# Ensure Java installed
-if ! command -v java >/dev/null 2>&1; then
-  if [ "$PKG" = apt ]; then
-    sudo apt-get update -y
-    sudo apt-get install -y default-jdk
-  elif [ "$PKG" = dnf ]; then
-    sudo dnf install -y java-11-openjdk || sudo dnf install -y java-17-openjdk
-  elif [ "$PKG" = yum ]; then
-    sudo yum install -y java-11-openjdk || sudo yum install -y java-17-openjdk
-  else
-    echo "ERROR: No package manager to install Java" >&2; exit 1
-  fi
-fi
-
-# Derive JAVA_HOME and persist for tomcat9 (Debian/Ubuntu service layout)
-JAVA_DIR=$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")
-if [ -d /etc/default ]; then
-  if [ -f /etc/default/tomcat9 ]; then
-    if grep -q '^JAVA_HOME=' /etc/default/tomcat9; then
-      sudo sed -i "s|^JAVA_HOME=.*|JAVA_HOME=${JAVA_DIR}|" /etc/default/tomcat9
-    else
-      echo "JAVA_HOME=${JAVA_DIR}" | sudo tee -a /etc/default/tomcat9 >/dev/null
-    fi
-  fi
-fi
-
-# Function to find webapps dir
 find_webapps() {
-  [ -d /var/lib/tomcat9/webapps ] && { echo /var/lib/tomcat9/webapps; return; }
-  [ -d /var/lib/tomcat/webapps  ] && { echo /var/lib/tomcat/webapps;  return; }
-  [ -d /usr/share/tomcat/webapps ] && { echo /usr/share/tomcat/webapps; return; }
-  [ -d /opt/tomcat/webapps ] && { echo /opt/tomcat/webapps; return; }
-  for d in /usr/share/apache-tomcat*/webapps; do
-    [ -d "$d" ] && { echo "$d"; return; }
+  for d in \
+    /var/lib/tomcat9/webapps \
+    /var/lib/tomcat/webapps \
+    /usr/share/tomcat/webapps \
+    /opt/tomcat/webapps \
+    /usr/share/apache-tomcat*/webapps
+  do
+    # glob may stay literal for non-existent apache-tomcat*; suppress errors
+    for dd in $d; do
+      [ -d "$dd" ] && echo "$dd" && return 0
+    done
   done
-  echo ""
+  return 1
 }
 
-# Ensure Tomcat installed (package) if not found
-WEBAPPS=$(find_webapps)
-if [ -z "$WEBAPPS" ]; then
+WEBAPPS=""
+if find_webapps >/dev/null 2>&1; then
+  WEBAPPS="$(find_webapps)"
+else
   if [ "$PKG" = apt ]; then
     sudo apt-get update -y
     sudo apt-get install -y tomcat9
@@ -120,14 +82,18 @@ if [ -z "$WEBAPPS" ]; then
   elif [ "$PKG" = yum ]; then
     sudo yum install -y tomcat
   else
-    echo "ERROR: Could not install Tomcat (no pkg mgr)" >&2; exit 1
+    echo "No supported package manager found." >&2
+    exit 1
   fi
-  WEBAPPS=$(find_webapps)
+  WEBAPPS="$(find_webapps || true)"
 fi
 
-[ -n "$WEBAPPS" ] || { echo "ERROR: Could not find Tomcat webapps directory after install."; exit 1; }
+if [ -z "${WEBAPPS:-}" ]; then
+  echo "ERROR: Could not find Tomcat webapps directory after install." >&2
+  exit 1
+fi
 
-# Determine service name
+# Service name
 if systemctl list-unit-files | grep -q '^tomcat9\\.service'; then
   SVC=tomcat9
 elif systemctl list-unit-files | grep -q '^tomcat\\.service'; then
@@ -136,38 +102,29 @@ else
   SVC=tomcat9
 fi
 
-echo "Using WEBAPPS=${WEBAPPS}  SVC=${SVC}  JAVA_HOME=${JAVA_DIR}"
+echo "Using WEBAPPS=$WEBAPPS  SVC=$SVC  CONTEXT=$CONTEXT  WAR_NAME=$WAR_NAME"
 
-# Stop Tomcat (ignore if not running)
-sudo systemctl stop "${SVC}" || true
+# Stop if running (ignore errors)
+sudo systemctl stop "$SVC" || true
 
-# Deploy WAR
-CONTEXT="${CONTEXT}"
-WAR_NAME="${WAR_NAME}"
+# Clean any previous deploy
+sudo rm -rf "$WEBAPPS/$CONTEXT" "$WEBAPPS/$CONTEXT.war" || true
 
-# If deploying as ROOT, the file must be ROOT.war
-TARGET_WAR="${WEBAPPS}/${CONTEXT}.war"
-if [ "${CONTEXT}" = "ROOT" ]; then
-  TARGET_WAR="${WEBAPPS}/ROOT.war"
-fi
+# Move new WAR
+sudo mv "/tmp/$WAR_NAME" "$WEBAPPS/$CONTEXT.war"
 
-sudo rm -rf "${WEBAPPS:?}/${CONTEXT}" "${TARGET_WAR}" || true
-sudo mv "/tmp/${WAR_NAME}" "${TARGET_WAR}"
-
-# Ownership if tomcat user exists
+# Fix ownership if tomcat user exists
 if id tomcat >/dev/null 2>&1; then
-  sudo chown tomcat:tomcat "${TARGET_WAR}"
+  sudo chown tomcat:tomcat "$WEBAPPS/$CONTEXT.war"
 elif id tomcat9 >/dev/null 2>&1; then
-  sudo chown tomcat9:tomcat9 "${TARGET_WAR}"
+  sudo chown tomcat9:tomcat9 "$WEBAPPS/$CONTEXT.war"
 fi
 
-# Start Tomcat and wait
-sudo systemctl daemon-reload || true
-sudo systemctl start "${SVC}"
-sudo systemctl is-active "${SVC}"
-sleep 8
-
-REMOTE
+# Start and wait for auto-deploy
+sudo systemctl start "$SVC"
+sudo systemctl is-active "$SVC"
+sleep 6
+EOS
         '''
       }
     }
@@ -175,38 +132,15 @@ REMOTE
     stage('Smoke test') {
       steps {
         sh '''
-          set -Eeuo pipefail
-          if [ "${CONTEXT}" = "ROOT" ]; then
-            URL="http://${APP_HOST}:${PORT}/"
-          else
-            URL="http://${APP_HOST}:${PORT}/${CONTEXT}/"
-          fi
-          echo "Probing: $URL"
-          # Try a few times to allow auto-deploy
-          for i in 1 2 3 4 5; do
-            if curl -fsSIL "$URL" >/dev/null 2>&1; then
-              echo "✅ Up: $URL"
-              exit 0
-            fi
-            sleep 3
-          done
-          echo "ERROR: App did not respond at $URL"
-          curl -v "$URL" || true
-          exit 1
+          set -eux
+          curl -fsS "http://$APP_HOST:8080/$CONTEXT"  || curl -fsS "http://$APP_HOST:8080/$CONTEXT/" || true
+          echo "✅ Deployed to: http://$APP_HOST:8080/$CONTEXT/"
         '''
       }
     }
   }
 
   post {
-    success {
-      script {
-        def base = (env.CONTEXT == 'ROOT') ? '/' : "/${env.CONTEXT}/"
-        echo "🎉 Deployed: http://${env.APP_HOST}:${env.PORT}${base}"
-      }
-    }
-    failure {
-      echo "❌ Deployment failed. Check the stage logs above."
-    }
+    failure { echo "❌ Deployment failed. Check the stage logs above." }
   }
 }
