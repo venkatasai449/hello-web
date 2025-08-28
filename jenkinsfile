@@ -6,7 +6,7 @@ pipeline {
     APP_HOST = '35.89.163.155'      // e.g. 35.89.163.155
     APP_USER = 'ubuntu'                         // 'ubuntu' for Ubuntu AMIs, 'ec2-user' for Amazon Linux
     SSH_KEY  = '/var/lib/jenkins/.ssh/app.pem'  // path on the Jenkins box
-    CONTEXT  = 'addressbook'                    // URL context => http://IP:8080/addressbook/
+    CONTEXT  = 'ROOT'                    // URL context => http://IP:8080/addressbook/
     WAR_NAME = 'addressbook.war'                // produced by your pom.xml
   }
 
